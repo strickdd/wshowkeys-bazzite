@@ -1,0 +1,221 @@
+--- a/main.c
++++ b/main.c
+@@ -3,6 +3,7 @@
+ #include <cairo/cairo.h>
+ #include <getopt.h>
+ #include <libinput.h>
++#include <linux/input-event-codes.h>
+ #include <libudev.h>
+ #include <poll.h>
+ #include <stdbool.h>
+@@ -22,6 +23,7 @@
+ 
+ struct wsk_keypress {
+ 	xkb_keysym_t sym;
++	bool click;
+ 	char name[128];
+ 	char utf8[128];
+ 	struct wsk_keypress *next;
+@@ -43,6 +45,8 @@
+ 	uint32_t foreground, background, specialfg;
+ 	const char *font;
+ 	int timeout;
++	uint32_t clickfg;
++	bool show_clicks;
+ 
+ 	struct wl_display *display;
+ 	struct wl_registry *registry;
+@@ -57,6 +61,7 @@
+ 	struct zwlr_layer_surface_v1 *layer_surface;
+ 	uint32_t width, height;
+ 	bool frame_scheduled, dirty;
++	bool configured;
+ 	struct pool_buffer buffers[2];
+ 	struct pool_buffer *current_buffer;
+ 	struct wsk_output *output, *outputs;
+@@ -106,7 +111,10 @@
+ 	while (key) {
+ 		bool special = false;
+ 		const char *name = key->utf8;
+-		if (!name[0]) {
++		if (key->click) {
++			cairo_set_source_u32(cairo, state->clickfg);
++			name = key->name;
++		} else if (!name[0]) {
+ 			special = true;
+ 			cairo_set_source_u32(cairo, state->specialfg);
+ 			name = key->name;
+@@ -155,21 +163,26 @@
+ 	int scale = state->output ? state->output->scale : 1;
+ 	uint32_t width = 0, height = 0;
+ 	render_to_cairo(cairo, state, scale, &width, &height);
+-	if (height / scale != state->height
++	bool blank = width == 0 || height == 0;
++	if (blank) {
++		// Nothing to show. Stay mapped with a 1x1 fully transparent
++		// buffer instead of attaching a NULL one: unmapping a layer
++		// surface makes KWin close it, and a re-mapped surface must wait
++		// for a fresh configure before a buffer may be attached again.
++		width = height = scale;
++	}
++	if (!state->configured
++			|| height / scale != state->height
+ 			|| width / scale != state->width
+ 			|| state->width == 0) {
+ 		// Reconfigure surface
+-		if (width == 0 || height == 0) {
+-			wl_surface_attach(state->surface, NULL, 0, 0);
+-		} else {
+-			zwlr_layer_surface_v1_set_size(
+-					state->layer_surface, width / scale, height / scale);
+-		}
++		zwlr_layer_surface_v1_set_size(
++				state->layer_surface, width / scale, height / scale);
+ 
+ 		// TODO: this could infinite loop if the compositor assigns us a
+ 		// different height than what we asked for
+ 		wl_surface_commit(state->surface);
+-	} else if (height > 0) {
++	} else {
+ 		// Replay recording into shm and send it off
+ 		state->current_buffer = get_next_buffer(state->shm,
+ 				state->buffers, state->width * scale, state->height * scale);
+@@ -185,8 +198,10 @@
+ 		cairo_paint(shm);
+ 		cairo_restore(shm);
+ 
+-		cairo_set_source_surface(shm, recorder, 0.0, 0.0);
+-		cairo_paint(shm);
++		if (!blank) {
++			cairo_set_source_surface(shm, recorder, 0.0, 0.0);
++			cairo_paint(shm);
++		}
+ 
+ 		wl_surface_set_buffer_scale(state->surface, scale);
+ 		wl_surface_attach(state->surface,
+@@ -211,6 +226,7 @@
+ 	struct wsk_state *state = data;
+ 	state->width = width;
+ 	state->height = height;
++	state->configured = true;
+ 	zwlr_layer_surface_v1_ack_configure(zwlr_layer_surface_v1, serial);
+ 	set_dirty(state);
+ }
+@@ -413,13 +429,52 @@
+ 	.global_remove = registry_global_remove,
+ };
+ 
++static void append_click(struct wsk_state *state, const char *name) {
++	struct wsk_keypress *keypress = calloc(1, sizeof(struct wsk_keypress));
++	assert(keypress);
++	keypress->click = true;
++	snprintf(keypress->name, sizeof(keypress->name), "%s", name);
++
++	struct wsk_keypress **link = &state->keys;
++	while (*link) {
++		link = &(*link)->next;
++	}
++	*link = keypress;
++}
++
+ static void handle_libinput_event(struct wsk_state *state,
+ 		struct libinput_event *event) {
+-	if (!state->xkb_state) {
++	enum libinput_event_type event_type = libinput_event_get_type(event);
++
++	if (event_type == LIBINPUT_EVENT_POINTER_BUTTON) {
++		if (!state->show_clicks) {
++			return;
++		}
++		struct libinput_event_pointer *pevent =
++			libinput_event_get_pointer_event(event);
++		if (libinput_event_pointer_get_button_state(pevent)
++				!= LIBINPUT_BUTTON_STATE_PRESSED) {
++			return;
++		}
++		const char *name;
++		switch (libinput_event_pointer_get_button(pevent)) {
++		case BTN_LEFT:   name = "Left-Click";   break;
++		case BTN_MIDDLE: name = "Middle-Click"; break;
++		case BTN_RIGHT:  name = "Right-Click";  break;
++		case BTN_SIDE:   name = "Mouse-4";      break;
++		case BTN_EXTRA:  name = "Mouse-5";      break;
++		default:
++			return;
++		}
++		append_click(state, name);
++		clock_gettime(CLOCK_MONOTONIC, &state->last_key);
++		set_dirty(state);
+ 		return;
+ 	}
+ 
+-	enum libinput_event_type event_type = libinput_event_get_type(event);
++	if (!state->xkb_state) {
++		return;
++	}
+ 	if (event_type != LIBINPUT_EVENT_KEYBOARD_KEY) {
+ 		return;
+ 	}
+@@ -517,8 +572,16 @@
+ 	state.timeout = 1;
+ 
+ 	int c;
+-	while ((c = getopt(argc, argv, "hb:f:s:F:t:a:m:o:")) != -1) {
++	bool clickfg_set = false;
++	while ((c = getopt(argc, argv, "chb:f:s:C:F:t:a:m:o:")) != -1) {
+ 		switch (c) {
++		case 'c':
++			state.show_clicks = true;
++			break;
++		case 'C':
++			state.clickfg = parse_color(optarg);
++			clickfg_set = true;
++			break;
+ 		case 'b':
+ 			state.background = parse_color(optarg);
+ 			break;
+@@ -552,13 +615,20 @@
+ 			fprintf(stderr, "-o is unimplemented\n");
+ 			return 0;
+ 		default:
+-			fprintf(stderr, "usage: wshowkeys [-b|-f|-s #RRGGBB[AA]] [-F font] "
+-					"[-t timeout]\n\t[-a top|left|right|bottom] [-m margin] "
+-					"[-o output]\n");
++			fprintf(stderr, "usage: wshowkeys [-c] "
++					"[-b|-f|-s|-C #RRGGBB[AA]] [-F font] [-t timeout]\n"
++					"\t[-a top|left|right|bottom] [-m margin] [-o output]\n\n"
++					"\t-b  background       -f  key text\n"
++					"\t-s  modifier text    -C  mouse-click text\n"
++					"\t-c  also show mouse buttons\n");
+ 			return 1;
+ 		}
+ 	}
+ 
++	if (!clickfg_set) {
++		state.clickfg = state.specialfg;
++	}
++
+ 	state.udev = udev_new();
+ 	if (!state.udev) {
+ 		fprintf(stderr, "udev_create: %s\n", strerror(errno));
+@@ -621,6 +691,12 @@
+ 	assert(state.surface);
+ 	wl_surface_add_listener(state.surface, &wl_surface_listener, &state);
+ 
++	// An empty input region keeps the overlay from swallowing clicks.
++	struct wl_region *input_region =
++		wl_compositor_create_region(state.compositor);
++	wl_surface_set_input_region(state.surface, input_region);
++	wl_region_destroy(input_region);
++
+ 	state.layer_surface = zwlr_layer_shell_v1_get_layer_surface(
+ 			state.layer_shell, state.surface, NULL,
+ 			ZWLR_LAYER_SHELL_V1_LAYER_TOP, "showkeys");
+@@ -631,6 +707,7 @@
+ 	zwlr_layer_surface_v1_set_margin(state.layer_surface,
+ 			margin, margin, margin, margin);
+ 	zwlr_layer_surface_v1_set_exclusive_zone(state.layer_surface, -1);
++	zwlr_layer_surface_v1_set_size(state.layer_surface, 1, 1);
+ 	wl_surface_commit(state.surface);
+ 
+ 	struct pollfd pollfds[] = {
